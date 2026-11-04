@@ -2,7 +2,7 @@
 
 Track prop firm **evals**, **payouts**, and **net profit** in a clean dark desktop app — with FX conversion from the **exact date** of each transaction.
 
-![PropFirm Tracker screenshot](docs/screenshot.png)
+![PropFirmTracker screenshot](screenshot.png)
 
 ## Download
 
