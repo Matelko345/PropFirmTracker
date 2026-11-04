@@ -1,0 +1,94 @@
+{
+  "name": "propfirm-tracker",
+  "productName": "PropFirm Tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PropFirm Tracker — evals, payouts, FX conversion",
+  "author": "Matelko",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:app": "concurrently -k \"vite --host 127.0.0.1 --port 5173\" \"wait-on http://127.0.0.1:5173 && VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "vite build",
+    "build:app": "ELECTRON=1 vite build && electron-builder --mac dmg --arm64 && electron-builder --win nsis --x64",
+    "build:mac": "ELECTRON=1 vite build && electron-builder --mac dmg --arm64",
+    "build:win": "ELECTRON=1 vite build && electron-builder --win nsis --x64",
+    "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.matelko.propfirmtracker",
+    "productName": "PropFirm Tracker",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.finance",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "dmg": {
+      "title": "PropFirm Tracker",
+      "background": null,
+      "contents": [
+        {
+          "x": 140,
+          "y": 180,
+          "type": "file"
+        },
+        {
+          "x": 420,
+          "y": 180,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PropFirm Tracker"
+    }
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.12",
+    "vite": "^8.3.5",
+    "vite-plugin-pwa": "^2.0.0",
+    "wait-on": "^9.0.1"
+  },
+  "allowScripts": {
+    "electron@39.8.10": true,
+    "electron-winstaller@5.4.0": true,
+    "fsevents@2.3.3": true
+  }
+}
