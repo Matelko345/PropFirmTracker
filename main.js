@@ -8,6 +8,18 @@ const iEdit = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" strok
 const iDel = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>`
 
 const state = loadState()
+// Persist schema bump only when we still have the same entries (migrate adds fields, never drops rows)
+{
+  try {
+    const prev = JSON.parse(localStorage.getItem('propfirm-tracker-v1') || '{}')
+    const prevLen = Array.isArray(prev.entries) ? prev.entries.length : 0
+    if (prev.schemaVersion !== state.schemaVersion && state.entries.length >= prevLen) {
+      persist()
+    }
+  } catch {
+    /* ignore */
+  }
+}
 let editId = null
 let rateBusy = false
 
@@ -109,6 +121,78 @@ function applyStaticI18n() {
   $('sCancel').textContent = tr('close')
   $('sSave').textContent = tr('apply')
   $('sRecalc').textContent = tr('recalculating')
+  $('lLinkedEval').textContent = tr('linkedEval')
+  $('hLinkedEval').textContent = tr('linkedEvalHint')
+  if ($('lUpdates')) $('lUpdates').textContent = tr('updates')
+  if ($('lAutoUpdate')) $('lAutoUpdate').textContent = tr('autoUpdate')
+  if ($('hAutoUpdate')) $('hAutoUpdate').textContent = tr('autoUpdateHint')
+  if ($('sCheckUpdate')) $('sCheckUpdate').textContent = tr('checkUpdate')
+  if ($('sInstallUpdate')) $('sInstallUpdate').textContent = tr('installUpdate')
+}
+
+const hasDesktopApi = () => typeof window.propfirm?.isElectron === 'boolean' && window.propfirm.isElectron
+
+function setUpdateStatus(text) {
+  const el = $('sUpdateStatus')
+  if (el) el.textContent = text || ''
+}
+
+async function refreshUpdateSettingsUi() {
+  const box = $('updateSettings')
+  if (!box) return
+  if (!hasDesktopApi()) {
+    box.hidden = true
+    return
+  }
+  box.hidden = false
+  try {
+    const prefs = await window.propfirm.getUpdatePrefs()
+    $('sAutoUpdate').checked = prefs.autoUpdate !== false
+    const version = await window.propfirm.getVersion()
+    setUpdateStatus(tr('updateCurrent', { version }))
+  } catch {
+    setUpdateStatus('')
+  }
+}
+
+function passedEvals(firmFilter = '') {
+  return state.entries
+    .filter((e) => e.type === 'eval' && e.status === 'pass')
+    .filter((e) => !firmFilter || e.firm === firmFilter)
+    .sort((a, b) => b.date.localeCompare(a.date))
+}
+
+function accountLabel(evalEntry) {
+  if (!evalEntry) return tr('linkedNone')
+  const size = evalEntry.size ? ` · ${evalEntry.size}` : ''
+  const date = evalEntry.date
+    ? new Date(evalEntry.date + 'T12:00').toLocaleDateString(locale())
+    : ''
+  return `${evalEntry.firm}${size}${date ? ` · ${date}` : ''}`
+}
+
+function findEval(id) {
+  if (id == null) return null
+  return state.entries.find((e) => e.id === Number(id) && e.type === 'eval') || null
+}
+
+function fillLinkedEvalSelect(selectedId = null, firm = '') {
+  const sel = $('fLinkedEval')
+  const firmName = firm || $('fFirm').value.trim()
+  const list = passedEvals(firmName)
+  const allPassed = passedEvals()
+  const source = list.length ? list : allPassed
+  sel.innerHTML = `<option value="">${tr('linkedNone')}</option>`
+  source.forEach((e) => {
+    const o = document.createElement('option')
+    o.value = String(e.id)
+    o.textContent = accountLabel(e)
+    sel.appendChild(o)
+  })
+  if (selectedId != null && source.some((e) => e.id === Number(selectedId))) {
+    sel.value = String(selectedId)
+  }
+  $('hLinkedEval').textContent = source.length ? tr('linkedEvalHint') : tr('noPassedEvals')
 }
 
 function fillSettingsSelects() {
@@ -170,13 +254,13 @@ function renderStats() {
   const payConv = list
     .filter((e) => e.type === 'payout')
     .reduce((s, e) => s + convertedAmount(e, state.rate), 0)
-  const profitConv = payConv - evalConv
 
   const evalCount = list.filter((e) => e.type === 'eval').length
   const passCount = list.filter((e) => e.type === 'eval' && e.status === 'pass').length
   const failCount = list.filter((e) => e.type === 'eval' && e.status === 'fail').length
   const payCount = list.filter((e) => e.type === 'payout').length
 
+  // Net profit is shown only in the chart panel — no duplicate card
   $('stats').innerHTML = `
     <article class="stat glass">
       <div class="label">${tr('spent')}</div>
@@ -187,11 +271,6 @@ function renderStats() {
       <div class="label">${tr('payouts')}</div>
       <div class="value pos">${fMoney(payTotal, state.entryCurrency)}</div>
       <div class="sub">${fMoney(payConv, state.displayCurrency)}</div>
-    </article>
-    <article class="stat glass">
-      <div class="label">${tr('netProfit')}</div>
-      <div class="value ${profit >= 0 ? 'pos' : 'neg'}">${fMoney(profit, state.entryCurrency)}</div>
-      <div class="sub">${fMoney(profitConv, state.displayCurrency)}</div>
     </article>
     <article class="stat glass">
       <div class="label">${tr('roi')}</div>
@@ -206,6 +285,115 @@ function renderStats() {
   `
 }
 
+function renderChart() {
+  const list = [...filteredEntries()].sort((a, b) => a.date.localeCompare(b.date))
+  const panel = $('chartPanel')
+  panel.hidden = false
+
+  let running = 0
+  let runningConv = 0
+  const points = list.map((e) => {
+    const amt = entryAmount(e)
+    const conv = convertedAmount(e, state.rate)
+    const delta = e.type === 'payout' ? amt : -amt
+    const deltaConv = e.type === 'payout' ? conv : -conv
+    running += delta
+    runningConv += deltaConv
+    return { delta, e }
+  })
+
+  const maxAbs = Math.max(...points.map((p) => Math.abs(p.delta)), 1)
+  const net = running
+  const ticks = points.length
+    ? points
+        .map((p) => {
+          const h = Math.max(8, Math.round((Math.abs(p.delta) / maxAbs) * 56))
+          const cls = p.delta >= 0 ? 'tick on' : 'tick neg-on'
+          return `<div class="${cls}" style="height:${h}px" title="${p.e.date}: ${p.delta >= 0 ? '+' : '−'}${fMoney(Math.abs(p.delta), state.entryCurrency)}"></div>`
+        })
+        .join('')
+    : ''
+
+  panel.innerHTML = `
+    <article class="chart-card glass">
+      <div class="chart-hd">
+        <div>
+          <div class="label">${tr('netProfit')}</div>
+          <div class="value ${net >= 0 ? 'pos' : 'neg'}">${list.length ? `${net >= 0 ? '+' : ''}${fMoney(net, state.entryCurrency)}` : '—'}</div>
+          <div class="sub">${list.length ? fMoney(runningConv, state.displayCurrency) : ''}</div>
+        </div>
+      </div>
+      ${ticks ? `<div class="tick-chart">${ticks}</div>` : `<div class="check-empty">${tr('chartEmpty')}</div>`}
+    </article>
+    <article class="check-card glass">
+      <div class="chart-hd">
+        <div>
+          <div class="label">${tr('checklist')}</div>
+        </div>
+      </div>
+      ${renderGoals()}
+    </article>
+  `
+}
+
+function renderGoals() {
+  if (!Array.isArray(state.goals)) state.goals = []
+  const items = state.goals
+    .map(
+      (g) => `
+      <div class="check-item ${g.done ? 'done' : ''}" data-goal-id="${g.id}">
+        <button type="button" class="check-toggle" data-goal-toggle="${g.id}" aria-label="toggle">${g.done ? '✓' : ''}</button>
+        <div class="check-body">
+          <div class="check-title">${escapeHtml(g.text)}</div>
+        </div>
+        <button type="button" class="check-del" data-goal-del="${g.id}" title="${tr('del')}">${iDel}</button>
+      </div>
+    `,
+    )
+    .join('')
+
+  return `
+    ${items ? `<div class="check-list">${items}</div>` : `<div class="check-empty">${tr('checklistEmpty')}</div>`}
+    <div class="check-add">
+      <input id="goalInput" class="input" type="text" maxlength="120" placeholder="${tr('checklistPh')}" />
+      <button type="button" class="btn glass success" id="goalAdd">${tr('checklistAdd')}</button>
+    </div>
+  `
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+}
+
+function addGoal(text) {
+  const value = text.trim()
+  if (!value) return
+  if (!Array.isArray(state.goals)) state.goals = []
+  state.goals.push({ id: state.nextGoalId++, text: value, done: false })
+  persist()
+  render()
+  const input = $('goalInput')
+  if (input) input.focus()
+}
+
+function toggleGoal(id) {
+  const g = state.goals.find((x) => x.id === Number(id))
+  if (!g) return
+  g.done = !g.done
+  persist()
+  render()
+}
+
+function deleteGoal(id) {
+  state.goals = state.goals.filter((x) => x.id !== Number(id))
+  persist()
+  render()
+}
+
 function renderHistory() {
   const sorted = [...filteredEntries()].sort((a, b) => b.date.localeCompare(a.date))
   const tb = $('histBody')
@@ -216,16 +404,23 @@ function renderHistory() {
     const isEval = e.type === 'eval'
     const amt = entryAmount(e)
     const conv = convertedAmount(e, state.rate)
+    const linked = !isEval ? findEval(e.linkedEvalId) : null
     const status = isEval
       ? `<span class="badge ${e.status === 'pass' ? 'b-pass' : e.status === 'fail' ? 'b-fail' : 'b-active'}">${
           e.status === 'pass' ? tr('badgePass') : e.status === 'fail' ? tr('badgeFail') : tr('badgeActive')
         }</span>${e.size ? `<span class="tag">${e.size}</span>` : ''}`
-      : `<span class="badge b-payout">${tr('badgePayout')}</span>`
+      : `<span class="badge b-payout">${tr('badgePayout')}</span>${
+          linked
+            ? `<span class="tag" title="${tr('linkedAccount')}">${linked.size || linked.firm}</span>`
+            : ''
+        }`
 
     const trEl = document.createElement('tr')
     trEl.innerHTML = `
       <td class="muted">${e.date ? new Date(e.date + 'T12:00').toLocaleDateString(locale()) : '—'}</td>
-      <td><strong>${e.firm || '—'}</strong></td>
+      <td><strong>${e.firm || '—'}</strong>${
+        linked ? `<div class="faint">${tr('linkedAccount')}: ${linked.size || accountLabel(linked)}</div>` : ''
+      }</td>
       <td><span class="badge ${isEval ? 'b-eval' : 'b-payout'}">${isEval ? tr('badgeEval') : tr('badgePayout')}</span></td>
       <td class="r mono"><span class="${isEval ? 'neg' : 'pos'}">${isEval ? '−' : '+'} ${fMoney(amt, state.entryCurrency)}</span></td>
       <td class="r mono muted">${fMoney(conv, state.displayCurrency)}${e.rate ? `<div class="faint">${e.rate.toFixed(4)}</div>` : ''}</td>
@@ -299,13 +494,17 @@ function render() {
   applyStaticI18n()
   updateFirmFilter()
   renderStats()
+  renderChart()
   renderHistory()
   renderFirms()
   $('footMeta').textContent = tr('autoSave', { n: state.entries.length })
 }
 
 function onTypeChange() {
-  $('evalFields').style.display = $('fType').value === 'eval' ? 'block' : 'none'
+  const isEval = $('fType').value === 'eval'
+  $('evalFields').style.display = isEval ? 'block' : 'none'
+  $('payoutFields').hidden = isEval
+  if (!isEval) fillLinkedEvalSelect($('fLinkedEval').value || null)
 }
 
 async function calcConverted() {
@@ -364,6 +563,7 @@ function openModal(type, id = null) {
     $('fSize').value = e.size || ''
     $('fStatus').value = e.status || 'active'
     $('fNote').value = e.note || ''
+    fillLinkedEvalSelect(e.linkedEvalId, e.firm || '')
     $('rateHint').textContent = e.rate
       ? tr('rateSaved', { rate: e.rate.toFixed(4) })
       : tr('rateHintIdle')
@@ -375,6 +575,7 @@ function openModal(type, id = null) {
     $('fSize').value = ''
     $('fStatus').value = 'active'
     $('fNote').value = ''
+    fillLinkedEvalSelect(null)
     $('rateHint').textContent = tr('rateHintIdle')
   }
 
@@ -391,6 +592,8 @@ function openSettings() {
   fillSettingsSelects()
   applyStaticI18n()
   $('sRecalc').hidden = true
+  $('sInstallUpdate').hidden = true
+  refreshUpdateSettingsUi()
   $('settingsOverlay').hidden = false
 }
 
@@ -410,6 +613,10 @@ async function saveSettings() {
   state.displayCurrency = nextDisplay
   persist()
 
+  if (hasDesktopApi()) {
+    await window.propfirm.setUpdatePrefs({ autoUpdate: $('sAutoUpdate').checked })
+  }
+
   if (currencyChanged) {
     $('sRecalc').hidden = false
     clearFxCache()
@@ -419,6 +626,21 @@ async function saveSettings() {
   await refreshFx()
   closeSettings()
   render()
+}
+
+async function checkForUpdatesClicked() {
+  if (!hasDesktopApi()) {
+    setUpdateStatus(tr('updateDev'))
+    return
+  }
+  setUpdateStatus(tr('updateChecking'))
+  $('sInstallUpdate').hidden = true
+  const result = await window.propfirm.checkForUpdates()
+  if (!result?.ok && result?.reason === 'dev') {
+    setUpdateStatus(tr('updateDev'))
+  } else if (!result?.ok) {
+    setUpdateStatus(tr('updateError', { message: result?.reason || 'unknown' }))
+  }
 }
 
 async function saveEntry() {
@@ -439,6 +661,7 @@ async function saveEntry() {
     return
   }
 
+  const linkedRaw = $('fLinkedEval').value
   const entry = {
     firm,
     type,
@@ -454,6 +677,7 @@ async function saveEntry() {
     size: $('fSize').value.trim(),
     status: $('fStatus').value,
     note: $('fNote').value.trim(),
+    linkedEvalId: type === 'payout' && linkedRaw ? Number(linkedRaw) : null,
   }
 
   if (editId != null) {
@@ -471,7 +695,9 @@ async function saveEntry() {
 function delEntry(id) {
   if (!confirm(tr('confirmDel'))) return
   state.entries = state.entries.filter((e) => e.id !== id)
+  if (state.entries.length === 0) state.__allowEmptySave = true
   persist()
+  delete state.__allowEmptySave
   render()
 }
 
@@ -574,12 +800,8 @@ $('importFile').addEventListener('change', async (ev) => {
   if (!file) return
   try {
     const data = await importJson(file)
-    state.entries = data.entries
-    state.nextId = data.nextId || Math.max(0, ...data.entries.map((e) => e.id)) + 1
-    if (data.lang) state.lang = data.lang
-    if (data.entryCurrency) state.entryCurrency = data.entryCurrency
-    if (data.displayCurrency) state.displayCurrency = data.displayCurrency
-    if (data.rate || data.usdPln) state.rate = data.rate || data.usdPln
+    Object.assign(state, data)
+    state.nextId = data.nextId || Math.max(0, ...data.entries.map((e) => e.id), 0) + 1
     persist()
     render()
     await backfillRates()
@@ -592,6 +814,15 @@ $('importFile').addEventListener('change', async (ev) => {
 $('mCancel').addEventListener('click', closeModal)
 $('mSave').addEventListener('click', () => saveEntry())
 $('fType').addEventListener('change', onTypeChange)
+$('fFirm').addEventListener('change', () => {
+  if ($('fType').value === 'payout') fillLinkedEvalSelect($('fLinkedEval').value || null)
+})
+$('fFirm').addEventListener('input', () => {
+  clearTimeout($('fFirm')._t)
+  $('fFirm')._t = setTimeout(() => {
+    if ($('fType').value === 'payout') fillLinkedEvalSelect($('fLinkedEval').value || null)
+  }, 200)
+})
 $('fAmount').addEventListener('input', () => {
   clearTimeout($('fAmount')._t)
   $('fAmount')._t = setTimeout(calcConverted, 280)
@@ -605,6 +836,41 @@ $('settingsOverlay').addEventListener('click', (e) => {
 })
 $('sCancel').addEventListener('click', closeSettings)
 $('sSave').addEventListener('click', () => saveSettings())
+$('sCheckUpdate')?.addEventListener('click', () => checkForUpdatesClicked())
+$('sInstallUpdate')?.addEventListener('click', async () => {
+  if (!hasDesktopApi()) return
+  await window.propfirm.installUpdate()
+})
+$('sAutoUpdate')?.addEventListener('change', async () => {
+  if (!hasDesktopApi()) return
+  await window.propfirm.setUpdatePrefs({ autoUpdate: $('sAutoUpdate').checked })
+})
+
+if (hasDesktopApi()) {
+  window.propfirm.onUpdateEvent((ev) => {
+    if (!ev) return
+    if (ev.type === 'checking') setUpdateStatus(tr('updateChecking'))
+    if (ev.type === 'available') {
+      setUpdateStatus(tr('updateAvailable', { version: ev.version }))
+      window.propfirm.downloadUpdate()
+    }
+    if (ev.type === 'not-available') {
+      setUpdateStatus(tr('updateNone', { version: ev.version }))
+      $('sInstallUpdate').hidden = true
+    }
+    if (ev.type === 'progress') {
+      setUpdateStatus(tr('updateDownloading', { percent: Math.round(ev.percent || 0) }))
+    }
+    if (ev.type === 'downloaded') {
+      setUpdateStatus(tr('updateReady'))
+      $('sInstallUpdate').hidden = false
+    }
+    if (ev.type === 'error') {
+      setUpdateStatus(tr('updateError', { message: ev.message || 'unknown' }))
+    }
+  })
+}
+
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return
   if (!$('overlay').hidden) closeModal()
@@ -616,6 +882,23 @@ $('histBody').addEventListener('click', (e) => {
   const del = e.target.closest('[data-del]')
   if (edit) openModal(null, Number(edit.dataset.edit))
   if (del) delEntry(Number(del.dataset.del))
+})
+
+$('chartPanel').addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-goal-toggle]')
+  const del = e.target.closest('[data-goal-del]')
+  if (toggle) toggleGoal(toggle.dataset.goalToggle)
+  if (del) deleteGoal(del.dataset.goalDel)
+  if (e.target.id === 'goalAdd' || e.target.closest('#goalAdd')) {
+    addGoal($('goalInput')?.value || '')
+  }
+})
+
+$('chartPanel').addEventListener('keydown', (e) => {
+  if (e.target.id === 'goalInput' && e.key === 'Enter') {
+    e.preventDefault()
+    addGoal(e.target.value || '')
+  }
 })
 
 if (navigator.userAgent.includes('Electron')) {
